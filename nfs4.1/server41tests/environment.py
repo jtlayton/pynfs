@@ -443,7 +443,7 @@ def do_readdir(sess, file, cookie=0, cookieverf=b'', attrs=0,
     # Since we may not get whole directory listing in one readdir request,
     # loop until we do. For each request result, create a flat list
     # with <entry4> objects.
-    log.info("Called do_readdir()")
+    log.debug("Called do_readdir()")
     entries = []
     baseops = use_obj(file)
     while True:
@@ -458,7 +458,7 @@ def do_readdir(sess, file, cookie=0, cookieverf=b'', attrs=0,
             break
         cookie = entries[-1].cookie
         cookieverf = res.resarray[-1].cookieverf
-    log.info("do_readdir() = %r" % entries)
+    log.debug("do_readdir() = %r" % entries)
     return entries
 
 def do_getattrdict(sess, file, attrlist):
