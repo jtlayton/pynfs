@@ -38,6 +38,9 @@ def _create_and_open(sess, name):
     stateid = res.resarray[-2].stateid
     return fh, stateid
 
+def _bad_stateid():
+    return stateid4(0xffffffff, b'\xff' * 12)
+
 def testSyncCopy(t, env):
     """synchronous copy of a file and verify contents
 
@@ -223,3 +226,17 @@ def testOffloadCancel(t, env):
     res = sess.compound(ops)
     check(res, [NFS4_OK, NFS4ERR_NOTSUPP, NFS4ERR_COMPLETE_ALREADY],
           msg="OFFLOAD_CANCEL")
+
+def testCopyBadSourceStateid(t, env):
+    """COPY with an invalid source stateid should fail
+
+    FLAGS: copy
+    CODE: COPY8
+    """
+    sess = env.c1.new_client_session(env.testname(t))
+    src_fh, _src_stateid = _create_and_open(sess, env.testname(t))
+    dst_fh, dst_stateid = _create_and_open(sess, env.testname(t) + b"_dst")
+
+    res = _do_copy(sess, src_fh, _bad_stateid(), dst_fh, dst_stateid,
+                   count=1024, synchronous=1)
+    check(res, NFS4ERR_BAD_STATEID, msg="COPY with bad source stateid")
