@@ -5,6 +5,7 @@ from xdrdef.nfs4_type import channel_attrs4
 import nfs_ops
 op = nfs_ops.NFS4ops()
 import nfs4lib
+import os
 import subprocess
 import time
 
@@ -298,18 +299,21 @@ def testBadSequenceidAtSlot(t, env):
     res = c.c.compound([op.sequence(sid, nfs4lib.dec_u32(seqid), 2, 3, True)])
     check(res, NFS4ERR_SEQ_MISORDERED)
 
+_DROP_CACHES = '/proc/sys/vm/drop_caches'
+
 def _trigger_slab_shrinker():
     """Try to trigger slab shrinkers via drop_caches.
 
     Returns True if we were able to trigger it, False otherwise.
-    This requires root privileges on the local machine (which must
-    also be the NFS server under test).
+    This requires root privileges and /proc/sys/vm/drop_caches to exist.
     """
+    if not os.path.exists(_DROP_CACHES):
+        return False
     try:
-        subprocess.run(['sh', '-c', 'echo 2 > /proc/sys/vm/drop_caches'],
-                       check=True, timeout=5, capture_output=True)
+        with open(_DROP_CACHES, 'w') as f:
+            f.write('2\n')
         return True
-    except (subprocess.CalledProcessError, PermissionError, OSError):
+    except (PermissionError, OSError):
         return False
 
 def testSlotShrinkUAF(t, env):
@@ -343,22 +347,28 @@ def testSlotShrinkUAF(t, env):
     maxslots = sess.fore_channel.maxrequests
     slot_seqids = {}
     for i in range(maxslots):
-        res = env.c1.c.compound([op.sequence(sid, 1, i, maxslots - 1, False)])
+        res = c.c.compound([op.sequence(sid, 1, i, maxslots - 1, False)])
         check(res)
         slot_seqids[i] = 1
 
-    # Try to trigger the nfsd DRC slot shrinker
-    if not _trigger_slab_shrinker():
-        t.fail_support("Cannot trigger slab shrinker "
-                       "(need root on the local NFS server)")
+    # Try to trigger the nfsd DRC slot shrinker.
+    # Only attempt drop_caches when testing against the local machine.
+    server = env.opts.server
+    is_local = server in ("localhost", "127.0.0.1", "::1")
+    if is_local and not _trigger_slab_shrinker():
+        is_local = False
+
+    if not is_local:
+        t.fail_support("Cannot trigger slab shrinker; test requires "
+                       "root on the local NFS server (server=%s)" % server)
 
     # Give the shrinker a moment to run
     time.sleep(0.1)
 
     # Probe slot 0 to read sr_target_highest_slotid from the response
     slot_seqids[0] += 1
-    res = env.c1.c.compound([op.sequence(sid, slot_seqids[0], 0,
-                                         maxslots - 1, False)])
+    res = c.c.compound([op.sequence(sid, slot_seqids[0], 0,
+                                    maxslots - 1, False)])
     check(res)
     sr = res.resarray[0]
     # sr_target_highest_slotid is 0-based; convert to 1-based count
@@ -372,8 +382,8 @@ def testSlotShrinkUAF(t, env):
                 break
             time.sleep(0.2)
             slot_seqids[0] += 1
-            res = env.c1.c.compound([op.sequence(sid, slot_seqids[0], 0,
-                                                 maxslots - 1, False)])
+            res = c.c.compound([op.sequence(sid, slot_seqids[0], 0,
+                                            maxslots - 1, False)])
             check(res)
             sr = res.resarray[0]
             target = sr.sr_target_highest_slotid + 1
@@ -397,8 +407,8 @@ def testSlotShrinkUAF(t, env):
     #     slot->sl_generation = session->se_slot_gen
     # bringing the slot up to the current generation.
     slot_seqids[S] += 1
-    res = env.c1.c.compound([op.sequence(sid, slot_seqids[S], S,
-                                         highest - 1, True)])
+    res = c.c.compound([op.sequence(sid, slot_seqids[S], S,
+                                    highest - 1, True)])
     check(res, msg="Step 1: SEQUENCE on slot %d to sync generation" % S)
 
     # Step 2: SEQUENCE on slot S with sa_highest_slotid < target
@@ -417,8 +427,8 @@ def testSlotShrinkUAF(t, env):
     # and either skip the shrink or reject with NFS4ERR_BADSLOT.
     slot_seqids[S] += 1
     sa_highest = target - 2 if target >= 2 else 0
-    res = env.c1.c.compound([op.sequence(sid, slot_seqids[S], S,
-                                         sa_highest, True)])
+    res = c.c.compound([op.sequence(sid, slot_seqids[S], S,
+                                    sa_highest, True)])
     # If we get here at all, the server didn't crash.
     # An unpatched server with KASAN will have logged a UAF splat.
     # A patched server should return NFS4_OK (skipping the shrink)
