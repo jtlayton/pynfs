@@ -5,7 +5,6 @@ from xdrdef.nfs4_type import channel_attrs4
 import nfs_ops
 op = nfs_ops.NFS4ops()
 import nfs4lib
-import os
 import subprocess
 import time
 
@@ -299,21 +298,19 @@ def testBadSequenceidAtSlot(t, env):
     res = c.c.compound([op.sequence(sid, nfs4lib.dec_u32(seqid), 2, 3, True)])
     check(res, NFS4ERR_SEQ_MISORDERED)
 
-_DROP_CACHES = '/proc/sys/vm/drop_caches'
-
 def _trigger_slab_shrinker():
     """Try to trigger slab shrinkers via drop_caches.
 
     Returns True if we were able to trigger it, False otherwise.
-    This requires root privileges and /proc/sys/vm/drop_caches to exist.
+    Uses sudo so the test can run as a normal user with passwordless
+    sudo configured.
     """
-    if not os.path.exists(_DROP_CACHES):
-        return False
     try:
-        with open(_DROP_CACHES, 'w') as f:
-            f.write('2\n')
+        subprocess.run(['sudo', 'sh', '-c',
+                        'echo 2 > /proc/sys/vm/drop_caches'],
+                       check=True, timeout=5, capture_output=True)
         return True
-    except (PermissionError, OSError):
+    except (subprocess.CalledProcessError, PermissionError, OSError):
         return False
 
 def testSlotShrinkUAF(t, env):
