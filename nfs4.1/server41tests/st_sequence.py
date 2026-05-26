@@ -5,6 +5,8 @@ from xdrdef.nfs4_type import channel_attrs4
 import nfs_ops
 op = nfs_ops.NFS4ops()
 import nfs4lib
+import subprocess
+import time
 
 def testSupported(t, env):
     """Do a simple SEQUENCE
@@ -295,3 +297,131 @@ def testBadSequenceidAtSlot(t, env):
 
     res = c.c.compound([op.sequence(sid, nfs4lib.dec_u32(seqid), 2, 3, True)])
     check(res, NFS4ERR_SEQ_MISORDERED)
+
+def _trigger_slab_shrinker():
+    """Try to trigger slab shrinkers via drop_caches.
+
+    Returns True if we were able to trigger it, False otherwise.
+    This requires root privileges on the local machine (which must
+    also be the NFS server under test).
+    """
+    try:
+        subprocess.run(['sh', '-c', 'echo 2 > /proc/sys/vm/drop_caches'],
+                       check=True, timeout=5, capture_output=True)
+        return True
+    except (subprocess.CalledProcessError, PermissionError, OSError):
+        return False
+
+def testSlotShrinkUAF(t, env):
+    """SEQUENCE must not free the slot it is currently using
+
+    When the server's DRC slot shrinker reduces se_target_maxslots
+    below maxreqs, a SEQUENCE using a slot in [target, maxreqs) with
+    sa_highest_slotid < target satisfies all three shrink conditions
+    while placing its own slot in the freed range.  On unpatched
+    kernels this is a heap use-after-free (CVE pending).
+
+    The test triggers the shrinker via drop_caches (requires root on
+    the NFS server, which must be the local machine).  On a
+    KASAN-enabled kernel the UAF will produce a splat; on production
+    kernels the server may crash or silently corrupt memory.
+
+    A patched server should either skip the shrink (because the
+    in-use slot is in the shrink range) or return NFS4ERR_BADSLOT.
+
+    FLAGS: sequence
+    CODE: SEQ14
+    """
+    c = env.c1.new_client(env.testname(t))
+    # Request 8 slots so there is room for the shrinker to reduce
+    attrs = channel_attrs4(0, 8192, 8192, 8192, 128, 8, [])
+    sess = c.create_session(fore_attrs=attrs)
+    sid = sess.sessionid
+
+    # Initialize every slot with a SEQUENCE so they all have seqid=1
+    # Use sa_highest_slotid = maxslots-1 (normal behavior)
+    maxslots = sess.fore_channel.maxrequests
+    slot_seqids = {}
+    for i in range(maxslots):
+        res = env.c1.c.compound([op.sequence(sid, 1, i, maxslots - 1, False)])
+        check(res)
+        slot_seqids[i] = 1
+
+    # Try to trigger the nfsd DRC slot shrinker
+    if not _trigger_slab_shrinker():
+        t.fail_support("Cannot trigger slab shrinker "
+                       "(need root on the local NFS server)")
+
+    # Give the shrinker a moment to run
+    time.sleep(0.1)
+
+    # Probe slot 0 to read sr_target_highest_slotid from the response
+    slot_seqids[0] += 1
+    res = env.c1.c.compound([op.sequence(sid, slot_seqids[0], 0,
+                                         maxslots - 1, False)])
+    check(res)
+    sr = res.resarray[0]
+    # sr_target_highest_slotid is 0-based; convert to 1-based count
+    target = sr.sr_target_highest_slotid + 1
+    highest = sr.sr_highest_slotid + 1
+
+    if target >= highest:
+        # Shrinker didn't fire or didn't reduce enough; try harder
+        for attempt in range(5):
+            if not _trigger_slab_shrinker():
+                break
+            time.sleep(0.2)
+            slot_seqids[0] += 1
+            res = env.c1.c.compound([op.sequence(sid, slot_seqids[0], 0,
+                                                 maxslots - 1, False)])
+            check(res)
+            sr = res.resarray[0]
+            target = sr.sr_target_highest_slotid + 1
+            highest = sr.sr_highest_slotid + 1
+            if target < highest:
+                break
+
+    if target >= highest:
+        t.fail_support("Shrinker did not reduce se_target_maxslots below "
+                       "maxreqs (%d); try on a KASAN/debug kernel or "
+                       "under memory pressure" % highest)
+
+    # Now target < highest.  Pick slot S in [target, highest).
+    S = target
+
+    # Step 1: SEQUENCE on slot S with sa_highest_slotid = highest-1
+    #
+    # The slot's sl_generation was 0 (kzalloc) but the shrinker bumped
+    # se_slot_gen, so the generation check fails and the shrink is
+    # skipped.  However, nfsd4_sequence() writes:
+    #     slot->sl_generation = session->se_slot_gen
+    # bringing the slot up to the current generation.
+    slot_seqids[S] += 1
+    res = env.c1.c.compound([op.sequence(sid, slot_seqids[S], S,
+                                         highest - 1, True)])
+    check(res, msg="Step 1: SEQUENCE on slot %d to sync generation" % S)
+
+    # Step 2: SEQUENCE on slot S with sa_highest_slotid < target
+    #
+    # Now all three shrink conditions are satisfied:
+    #   1. se_target_maxslots < se_fchannel.maxreqs  (shrinker lowered it)
+    #   2. slot->sl_generation == session->se_slot_gen  (set in step 1)
+    #   3. seq->maxslots <= se_target_maxslots  (we claim fewer slots)
+    #
+    # On an unpatched kernel, free_session_slots(session, target) will
+    # kfree slot S while the local pointer is still live, then
+    # nfsd4_sequence() writes into freed memory and stores the
+    # dangling pointer in cstate->slot.
+    #
+    # On a patched kernel, the server should notice that slotid >= target
+    # and either skip the shrink or reject with NFS4ERR_BADSLOT.
+    slot_seqids[S] += 1
+    sa_highest = target - 2 if target >= 2 else 0
+    res = env.c1.c.compound([op.sequence(sid, slot_seqids[S], S,
+                                         sa_highest, True)])
+    # If we get here at all, the server didn't crash.
+    # An unpatched server with KASAN will have logged a UAF splat.
+    # A patched server should return NFS4_OK (skipping the shrink)
+    # or NFS4ERR_BADSLOT (rejecting the slot).
+    check(res, [NFS4_OK, NFS4ERR_BADSLOT],
+          msg="Step 2: SEQUENCE on slot %d triggering shrink" % S)
