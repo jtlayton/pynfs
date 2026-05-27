@@ -257,6 +257,76 @@ def testFlexGetDevInfo(t, env):
     res = close_file(sess, fh, stateid=open_stateid)
     check(res)
 
+def testFlexGetDevInfoDecodeBody(t, env):
+    """Verify GETDEVICEINFO da_addr_body XDR length matches encoded content
+
+    The server must declare a da_addr_body length that exactly matches
+    the XDR-encoded ff_device_addr4.  A buggy server that uses unpadded
+    string lengths in the reservation will over-declare by 2-8 bytes,
+    leaking stale data and mis-aligning the version list.
+
+    FLAGS: flex
+    CODE: FFGDIXDR1
+    """
+    sess = env.c1.new_pnfs_client_session(env.testname(t))
+    res = create_file(sess, env.testname(t))
+    check(res)
+    fh = res.resarray[-1].object
+    open_stateid = res.resarray[-2].stateid
+
+    ops = [op.putfh(fh),
+           op.layoutget(False, LAYOUT4_FLEX_FILES,
+                        LAYOUTIOMODE4_RW,
+                        0, NFS4_MAXFILELEN, 8192, open_stateid, 0xffff)]
+    res = sess.compound(ops)
+    check(res)
+    lo_stateid = res.resarray[-1].logr_stateid
+
+    layout = res.resarray[-1].logr_layout[-1]
+    p = FlexUnpacker(layout.loc_body)
+    # Manually unpack just the mirrors — some servers omit
+    # ffl_stats_collect_hint so unpack_ff_layout4() may fail.
+    p.unpack_length4()  # ffl_stripe_unit
+    mirrors = p.unpack_array(p.unpack_ff_mirror4)
+    ds = mirrors[-1].ffm_data_servers[-1]
+    deviceid = ds.ffds_deviceid
+
+    ops = [op.putfh(fh),
+           op.getdeviceinfo(deviceid, LAYOUT4_FLEX_FILES, 0xffffffff, 0)]
+    res = sess.compound(ops)
+    check(res)
+
+    gda = res.resarray[-1].gdir_device_addr
+    raw_body = gda.da_addr_body
+
+    p = FlexUnpacker(raw_body)
+    da = p.unpack_ff_device_addr4()
+    try:
+        p.done()
+    except Exception as e:
+        fail("da_addr_body has trailing bytes after decode: "
+             "server likely miscalculated XDR padding: %s" % e)
+
+    # Re-encode and verify round-trip length matches
+    p2 = FlexPacker()
+    p2.pack_ff_device_addr4(da)
+    reencoded = p2.get_buffer()
+    if len(reencoded) != len(raw_body):
+        fail("da_addr_body length %d != re-encoded length %d; "
+             "server over/under-declared by %d bytes"
+             % (len(raw_body), len(reencoded),
+                len(raw_body) - len(reencoded)))
+
+    ops = [op.putfh(fh),
+           op.layoutreturn(False, LAYOUT4_FLEX_FILES, LAYOUTIOMODE4_ANY,
+                           layoutreturn4(LAYOUTRETURN4_FILE,
+                                         layoutreturn_file4(0, NFS4_MAXFILELEN,
+                                                            lo_stateid, empty_p.get_buffer())))]
+    res = sess.compound(ops)
+    check(res)
+    res = close_file(sess, fh, stateid=open_stateid)
+    check(res)
+
 def testFlexLayoutTestAccess(t, env):
     """Get both a LAYOUTIOMODE4_RW and LAYOUTIOMODE4_READ segment
     making sure that they have the same gid, but a different uid.
