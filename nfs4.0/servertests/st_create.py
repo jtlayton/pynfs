@@ -273,6 +273,47 @@ def testLongName(t, env):
     res = c.create_obj(c.homedir + [env.longname])
     check(res, NFS4ERR_NAMETOOLONG, "CREATE with very long component")
 
+def testSymlinkTargetTooLong(t, env):
+    """CREATE NF4LNK with symlink target >= PATH_MAX should return NFS4ERR_NAMETOOLONG
+
+    FLAGS: create symlink all
+    CODE: CR16
+    """
+    c = env.c1
+    ops = c.go_home()
+    objtype = createtype4(NF4LNK, linkdata=b'/' + b'a' * 4096)
+    ops += [op.create(objtype, t.word(), getDefaultAttr(c))]
+    res = c.compound(ops)
+    check(res, NFS4ERR_NAMETOOLONG,
+          "CREATE symlink with target length > PATH_MAX")
+
+def testSymlinkTargetExactlyPathMax(t, env):
+    """CREATE NF4LNK with symlink target == PATH_MAX (4096) should return NFS4ERR_NAMETOOLONG
+
+    FLAGS: create symlink all
+    CODE: CR17
+    """
+    c = env.c1
+    ops = c.go_home()
+    objtype = createtype4(NF4LNK, linkdata=b'/' + b'a' * 4095)
+    ops += [op.create(objtype, t.word(), getDefaultAttr(c))]
+    res = c.compound(ops)
+    check(res, NFS4ERR_NAMETOOLONG,
+          "CREATE symlink with target length == PATH_MAX")
+
+def testSymlinkTargetJustUnderPathMax(t, env):
+    """CREATE NF4LNK with symlink target == PATH_MAX - 1 should succeed
+
+    FLAGS: create symlink all
+    CODE: CR18
+    """
+    c = env.c1
+    ops = c.go_home()
+    objtype = createtype4(NF4LNK, linkdata=b'/' + b'a' * 4094)
+    ops += [op.create(objtype, t.word(), getDefaultAttr(c))]
+    res = c.compound(ops)
+    check(res, msg="CREATE symlink with target length == PATH_MAX - 1")
+
  ##############################################
 
 #FRED - need utf8 check
