@@ -41,4 +41,5 @@ __all__ = [ "st_access.py",
             "st_reboot.py",
             "st_delegation.py", # Not Done at all
             "st_spoof.py",
+            "st_posix_acl.py",
             ]
