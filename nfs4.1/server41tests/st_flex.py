@@ -327,6 +327,68 @@ def testFlexGetDevInfoDecodeBody(t, env):
     res = close_file(sess, fh, stateid=open_stateid)
     check(res)
 
+def testFlexLayoutGetDecodeBody(t, env):
+    """Verify LAYOUTGET loc_body XDR length matches encoded ff_layout4
+
+    The server must declare a loc_body length that exactly covers the
+    XDR-encoded ff_layout4.  A buggy server that miscalculates the
+    buffer reservation (e.g. missing XDR padding on opaque user/group
+    strings or omitting fixed-size fields from the length) will either
+    over-declare, leaking stale kernel memory, or under-declare,
+    writing past the reserved buffer and corrupting the XDR stream.
+
+    FLAGS: flex
+    CODE: FFLGXDR1
+    """
+    sess = env.c1.new_pnfs_client_session(env.testname(t))
+    res = create_file(sess, env.testname(t))
+    check(res)
+    fh = res.resarray[-1].object
+    open_stateid = res.resarray[-2].stateid
+
+    ops = [op.putfh(fh),
+           op.layoutget(False, LAYOUT4_FLEX_FILES,
+                        LAYOUTIOMODE4_RW,
+                        0, NFS4_MAXFILELEN, 8192, open_stateid, 0xffff)]
+    res = sess.compound(ops)
+    check(res)
+    lo_stateid = res.resarray[-1].logr_stateid
+
+    layout = res.resarray[-1].logr_layout[-1]
+    raw_body = layout.loc_body
+
+    p = FlexUnpacker(raw_body)
+    try:
+        fl = p.unpack_ff_layout4()
+    except EOFError:
+        fail("loc_body too short for ff_layout4: server under-declared "
+             "XDR buffer length (got %d bytes)" % len(raw_body))
+    try:
+        p.done()
+    except Exception as e:
+        fail("loc_body has trailing bytes after ff_layout4 decode: "
+             "server likely miscalculated XDR buffer length: %s" % e)
+
+    # Re-encode and verify round-trip length matches
+    p2 = FlexPacker()
+    p2.pack_ff_layout4(fl)
+    reencoded = p2.get_buffer()
+    if len(reencoded) != len(raw_body):
+        fail("loc_body length %d != re-encoded ff_layout4 length %d; "
+             "server over/under-declared by %d bytes"
+             % (len(raw_body), len(reencoded),
+                len(raw_body) - len(reencoded)))
+
+    ops = [op.putfh(fh),
+           op.layoutreturn(False, LAYOUT4_FLEX_FILES, LAYOUTIOMODE4_ANY,
+                           layoutreturn4(LAYOUTRETURN4_FILE,
+                                         layoutreturn_file4(0, NFS4_MAXFILELEN,
+                                                            lo_stateid, empty_p.get_buffer())))]
+    res = sess.compound(ops)
+    check(res)
+    res = close_file(sess, fh, stateid=open_stateid)
+    check(res)
+
 def testFlexLayoutTestAccess(t, env):
     """Get both a LAYOUTIOMODE4_RW and LAYOUTIOMODE4_READ segment
     making sure that they have the same gid, but a different uid.
