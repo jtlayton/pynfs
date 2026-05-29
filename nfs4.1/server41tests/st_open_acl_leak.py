@@ -59,8 +59,12 @@ def testOpenAclLeakBadClaim(t, env):
     posix_acl slab objects leak on every request.
 
     The test sends this malformed compound 100 times.  On a vulnerable
-    server, each iteration leaks one or more posix_acl slab objects.
-    Confirm the leak via /proc/slabinfo (posix_acl column) or KASAN.
+    server, each iteration leaks one or more posix_acl objects (via
+    kmalloc, not a dedicated slab).  Confirm the leak on the server
+    with kmemleak:
+
+        echo scan > /sys/kernel/debug/kmemleak
+        cat /sys/kernel/debug/kmemleak | grep posix_acl
 
     FLAGS: open acl all
     CODE: OPENACLLEAK1
