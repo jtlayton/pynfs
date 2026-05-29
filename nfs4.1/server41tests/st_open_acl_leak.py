@@ -18,6 +18,7 @@ from xdrdef.nfs4_type import (
 from .environment import check, fail, use_obj
 import nfs4lib
 import nfs_ops
+import testmod
 
 op = nfs_ops.NFS4ops()
 
@@ -82,6 +83,9 @@ def testOpenAclLeakBadClaim(t, env):
 
     for i in range(100):
         res = sess.compound(ops, packer=_BadClaimPacker)
+        if res.status == NFS4ERR_ATTRNOTSUPP:
+            raise testmod.UnsupportedException(
+                "server does not support FATTR4_ACL")
         if res.status != NFS4ERR_BADXDR:
             fail("Expected NFS4ERR_BADXDR, got %s" %
                  nfsstat4.get(res.status, res.status))
@@ -121,6 +125,9 @@ def testOpenAclLeakBadClaimDacl(t, env):
 
     for i in range(100):
         res = sess.compound(ops, packer=_BadClaimPacker)
+        if res.status == NFS4ERR_ATTRNOTSUPP:
+            raise testmod.UnsupportedException(
+                "server does not support FATTR4_DACL")
         if res.status != NFS4ERR_BADXDR:
             fail("Expected NFS4ERR_BADXDR, got %s" %
                  nfsstat4.get(res.status, res.status))
