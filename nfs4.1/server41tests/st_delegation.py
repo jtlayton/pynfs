@@ -717,22 +717,29 @@ def _deleg_times_return(sess, env, fh, delegstateid, ts):
     check(res)
     return res.resarray[-2].obj_attributes
 
-def _testDelegTimesStable(t, env):
+def _testDelegTimesStable(t, env, early_stamp=False):
     size = 5
 
     sess1, fh, stateid, delegstateid = _deleg_times_open(t, env)
 
+    # A client stamps mtime when the application writes, which is before
+    # the WRITE reaches the server
+    if early_stamp:
+        ts = _server_now(sess1, env, env.testname(t) + b"_clock")
+        env.sleep(.1)
     res = write_file(sess1, fh, b'z' * size, 0, delegstateid)
     check(res)
-    env.sleep(.1)
-    ts = _server_now(sess1, env, env.testname(t) + b"_clock")
+    if not early_stamp:
+        env.sleep(.1)
+        ts = _server_now(sess1, env, env.testname(t) + b"_clock")
 
     held = _deleg_times_return(sess1, env, fh, delegstateid, ts)
     after = do_getattrdict(sess1, fh, _STAT_ATTRS)
     res = close_file(sess1, fh, stateid=stateid)
     check(res)
 
-    if compareTimes(held[FATTR4_TIME_MODIFY], ts) != 0:
+    # A server may ignore a proxied time_modify that is before the file's
+    if not early_stamp and compareTimes(held[FATTR4_TIME_MODIFY], ts) != 0:
         fail(f"delegated time_modify not applied: {held[FATTR4_TIME_MODIFY]} != {ts}")
     _check_stat_same(held, after, "after DELEGRETURN")
 
@@ -748,3 +755,14 @@ def testDelegTimesReturn(t, env):
     CODE: DELEG28
     """
     _testDelegTimesStable(t, env)
+
+def testDelegTimesReturnEarlyStamp(t, env):
+    """Attributes seen under a timestamp delegation survive DELEGRETURN
+
+    As DELEG28, but the delegated time_modify predates the server's WRITE
+    stamp, as when a client stamps on write(2) and flushes later.
+
+    FLAGS: deleg all
+    CODE: DELEG29
+    """
+    _testDelegTimesStable(t, env, early_stamp=True)
