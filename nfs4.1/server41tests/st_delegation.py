@@ -827,3 +827,34 @@ def testDelegTimesCbGetattrEarlyStamp(t, env):
     CODE: DELEG31
     """
     _testDelegTimesStable(t, env, early_stamp=True, observe=True)
+
+def testDelegTimesTruncate(t, env):
+    """Attributes seen under a timestamp delegation survive DELEGRETURN
+
+    Get a write delegation with delegated timestamps, WRITE, then truncate
+    with a size-changing SETATTR, which has the server stamp c/mtime. Set a
+    delegated time_modify later than that stamp, GETATTR and DELEGRETURN.
+    A GETATTR after DELEGRETURN must report the same attributes.
+
+    FLAGS: deleg all
+    CODE: DELEG32
+    """
+    sess1, fh, stateid, delegstateid = _deleg_times_open(t, env)
+
+    res = write_file(sess1, fh, b'z' * 5, 0, delegstateid)
+    check(res)
+    res = sess1.compound([op.putfh(fh), op.setattr(delegstateid, {FATTR4_SIZE: 0})])
+    check(res)
+    env.sleep(.1)
+    ts = _server_now(sess1, env, env.testname(t) + b"_clock")
+
+    held = _deleg_times_return(sess1, env, fh, delegstateid, ts)
+    after = do_getattrdict(sess1, fh, _STAT_ATTRS)
+    res = close_file(sess1, fh, stateid=stateid)
+    check(res)
+
+    if held[FATTR4_SIZE] != 0:
+        fail(f"Bad size: {held[FATTR4_SIZE]} != 0")
+    if compareTimes(held[FATTR4_TIME_MODIFY], ts) != 0:
+        fail(f"delegated time_modify not applied: {held[FATTR4_TIME_MODIFY]} != {ts}")
+    _check_stat_same(held, after, "after DELEGRETURN")
