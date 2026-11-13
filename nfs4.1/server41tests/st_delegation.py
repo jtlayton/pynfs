@@ -661,3 +661,90 @@ def testCbGetattrAfterSyncWrite(t, env):
     if compareTimes(attrs2[FATTR4_TIME_MODIFY], attrs4[FATTR4_TIME_MODIFY]) != 0:
         fail(f"mtime after write ({attrs2[FATTR4_TIME_MODIFY]}) != "
              f"mtime from delegreturn ({attrs4[FATTR4_TIME_MODIFY]})")
+
+# Attributes that a stat-based cache (e.g. git's index) records
+_STAT_ATTRS = [FATTR4_CHANGE, FATTR4_SIZE, FATTR4_TIME_MODIFY, FATTR4_TIME_METADATA]
+
+def _check_stat_same(before, after, when):
+    for attr, name in ((FATTR4_CHANGE, "change"), (FATTR4_SIZE, "size")):
+        if before[attr] != after[attr]:
+            fail(f"{name} moved {when}: {before[attr]} -> {after[attr]}")
+    for attr, name in ((FATTR4_TIME_MODIFY, "time_modify"),
+                       (FATTR4_TIME_METADATA, "time_metadata")):
+        if compareTimes(before[attr], after[attr]) != 0:
+            fail(f"{name} moved {when}: {before[attr]} -> {after[attr]}")
+
+def _deleg_times_open(t, env):
+    """Create a file and get an OPEN_DELEGATE_WRITE_ATTRS_DELEG delegation"""
+    sess = env.c1.new_client_session(b"%s_1" % env.testname(t))
+
+    res = sess.compound([op.putrootfh(),
+                         op.getattr(nfs4lib.list2bitmap([FATTR4_SUPPORTED_ATTRS,
+                                                         FATTR4_OPEN_ARGUMENTS]))])
+    check(res)
+    caps = res.resarray[-1].obj_attributes
+    if (not caps[FATTR4_SUPPORTED_ATTRS] & (1 << FATTR4_OPEN_ARGUMENTS) or
+        not caps[FATTR4_OPEN_ARGUMENTS].oa_share_access_want &
+            (1 << OPEN_ARGS_SHARE_ACCESS_WANT_DELEG_TIMESTAMPS)):
+        t.fail_support("Server doesn't offer delegated timestamps")
+
+    openmask = (OPEN4_SHARE_ACCESS_READ |
+                OPEN4_SHARE_ACCESS_WRITE |
+                OPEN4_SHARE_ACCESS_WANT_WRITE_DELEG |
+                OPEN4_SHARE_ACCESS_WANT_DELEG_TIMESTAMPS)
+    fh, stateid, deleg = __create_file_with_deleg(sess, env.testname(t), openmask)
+    if deleg.delegation_type != OPEN_DELEGATE_WRITE_ATTRS_DELEG:
+        t.fail_support("Didn't get a write delegation with delegated timestamps")
+    return sess, fh, stateid, deleg.write.stateid
+
+def _deleg_times_return(sess, env, fh, delegstateid, ts):
+    """Return the delegation the way the Linux client does
+
+    PUTFH|SETATTR(delegated times)|GETATTR|DELEGRETURN. Returns the GETATTR
+    result: the last attributes seen while the delegation was held.
+    """
+    ops = [op.putfh(fh),
+           op.setattr(delegstateid, {FATTR4_TIME_DELEG_ACCESS: ts,
+                                     FATTR4_TIME_DELEG_MODIFY: ts}),
+           op.getattr(nfs4lib.list2bitmap(_STAT_ATTRS)),
+           op.delegreturn(delegstateid)]
+    # The server may reject the proxied times with NFS4ERR_DELAY
+    for i in range(5):
+        res = sess.compound(ops)
+        if res.status != NFS4ERR_DELAY:
+            break
+        env.sleep(1)
+    check(res)
+    return res.resarray[-2].obj_attributes
+
+def _testDelegTimesStable(t, env):
+    size = 5
+
+    sess1, fh, stateid, delegstateid = _deleg_times_open(t, env)
+
+    res = write_file(sess1, fh, b'z' * size, 0, delegstateid)
+    check(res)
+    env.sleep(.1)
+    ts = _server_now(sess1, env, env.testname(t) + b"_clock")
+
+    held = _deleg_times_return(sess1, env, fh, delegstateid, ts)
+    after = do_getattrdict(sess1, fh, _STAT_ATTRS)
+    res = close_file(sess1, fh, stateid=stateid)
+    check(res)
+
+    if compareTimes(held[FATTR4_TIME_MODIFY], ts) != 0:
+        fail(f"delegated time_modify not applied: {held[FATTR4_TIME_MODIFY]} != {ts}")
+    _check_stat_same(held, after, "after DELEGRETURN")
+
+def testDelegTimesReturn(t, env):
+    """Attributes seen under a timestamp delegation survive DELEGRETURN
+
+    Get a write delegation with delegated timestamps, WRITE, then set a
+    delegated time_modify later than the server's WRITE stamp, GETATTR and
+    DELEGRETURN. A GETATTR after DELEGRETURN must report the same change,
+    size, time_modify and time_metadata.
+
+    FLAGS: deleg all
+    CODE: DELEG28
+    """
+    _testDelegTimesStable(t, env)
