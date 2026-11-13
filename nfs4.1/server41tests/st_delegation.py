@@ -665,8 +665,10 @@ def testCbGetattrAfterSyncWrite(t, env):
 # Attributes that a stat-based cache (e.g. git's index) records
 _STAT_ATTRS = [FATTR4_CHANGE, FATTR4_SIZE, FATTR4_TIME_MODIFY, FATTR4_TIME_METADATA]
 
-def _check_stat_same(before, after, when):
+def _check_stat_same(before, after, when, change=True):
     for attr, name in ((FATTR4_CHANGE, "change"), (FATTR4_SIZE, "size")):
+        if attr == FATTR4_CHANGE and not change:
+            continue
         if before[attr] != after[attr]:
             fail(f"{name} moved {when}: {before[attr]} -> {after[attr]}")
     for attr, name in ((FATTR4_TIME_MODIFY, "time_modify"),
@@ -674,9 +676,18 @@ def _check_stat_same(before, after, when):
         if compareTimes(before[attr], after[attr]) != 0:
             fail(f"{name} moved {when}: {before[attr]} -> {after[attr]}")
 
-def _deleg_times_open(t, env):
-    """Create a file and get an OPEN_DELEGATE_WRITE_ATTRS_DELEG delegation"""
+def _deleg_times_open(t, env, cbattrs=None, cb=None):
+    """Create a file and get an OPEN_DELEGATE_WRITE_ATTRS_DELEG delegation
+
+    If cb is given, CB_GETATTR is answered with cbattrs, and sets cb.
+    """
     sess = env.c1.new_client_session(b"%s_1" % env.testname(t))
+    if cb is not None:
+        def getattr_post_hook(arg, env, res):
+            res.obj_attributes = cbattrs
+            env.notify = cb.set
+            return res
+        sess.client.cb_post_hook(OP_CB_GETATTR, getattr_post_hook)
 
     res = sess.compound([op.putrootfh(),
                          op.getattr(nfs4lib.list2bitmap([FATTR4_SUPPORTED_ATTRS,
@@ -717,10 +728,13 @@ def _deleg_times_return(sess, env, fh, delegstateid, ts):
     check(res)
     return res.resarray[-2].obj_attributes
 
-def _testDelegTimesStable(t, env, early_stamp=False):
+def _testDelegTimesStable(t, env, early_stamp=False, observe=False):
+    cb = threading.Event()
+    cbattrs = {}
     size = 5
 
-    sess1, fh, stateid, delegstateid = _deleg_times_open(t, env)
+    sess1, fh, stateid, delegstateid = _deleg_times_open(t, env, cbattrs, cb)
+    attrs1 = do_getattrdict(sess1, fh, [FATTR4_CHANGE])
 
     # A client stamps mtime when the application writes, which is before
     # the WRITE reaches the server
@@ -733,6 +747,23 @@ def _testDelegTimesStable(t, env, early_stamp=False):
         env.sleep(.1)
         ts = _server_now(sess1, env, env.testname(t) + b"_clock")
 
+    if observe:
+        # No need to bump FATTR4_CHANGE because we've already flushed our data
+        cbattrs[FATTR4_CHANGE] = attrs1[FATTR4_CHANGE]
+        cbattrs[FATTR4_SIZE] = size
+        cbattrs[FATTR4_TIME_DELEG_ACCESS] = ts
+        cbattrs[FATTR4_TIME_DELEG_MODIFY] = ts
+
+        sess2 = env.c1.new_client_session(b"%s_2" % env.testname(t))
+        slot = sess2.compound_async([op.putfh(fh),
+                                     op.getattr(nfs4lib.list2bitmap(_STAT_ATTRS))])
+        completed = cb.wait(2)
+        res = sess2.listen(slot)
+        if not completed:
+            fail("CB_GETATTR not received")
+        check(res)
+        seen = res.resarray[-1].obj_attributes
+
     held = _deleg_times_return(sess1, env, fh, delegstateid, ts)
     after = do_getattrdict(sess1, fh, _STAT_ATTRS)
     res = close_file(sess1, fh, stateid=stateid)
@@ -741,6 +772,10 @@ def _testDelegTimesStable(t, env, early_stamp=False):
     # A server may ignore a proxied time_modify that is before the file's
     if not early_stamp and compareTimes(held[FATTR4_TIME_MODIFY], ts) != 0:
         fail(f"delegated time_modify not applied: {held[FATTR4_TIME_MODIFY]} != {ts}")
+    if observe:
+        # The SETATTR replaces the server's WRITE stamp, so change may move
+        _check_stat_same(seen, held, "when the holder set the times it "
+                         "reported in CB_GETATTR", change=False)
     _check_stat_same(held, after, "after DELEGRETURN")
 
 def testDelegTimesReturn(t, env):
@@ -766,3 +801,17 @@ def testDelegTimesReturnEarlyStamp(t, env):
     CODE: DELEG29
     """
     _testDelegTimesStable(t, env, early_stamp=True)
+
+def testDelegTimesCbGetattr(t, env):
+    """Attributes seen through CB_GETATTR survive the holder's return
+
+    Get a write delegation with delegated timestamps and WRITE. A second
+    client's GETATTR triggers CB_GETATTR, which reports a time_modify later
+    than the server's WRITE stamp. The holder then sets that same time and
+    returns the delegation. The second client's view, the holder's last
+    view and a GETATTR after DELEGRETURN must all match.
+
+    FLAGS: deleg all
+    CODE: DELEG30
+    """
+    _testDelegTimesStable(t, env, observe=True)
