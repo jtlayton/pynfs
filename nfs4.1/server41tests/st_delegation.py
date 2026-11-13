@@ -327,6 +327,23 @@ def testServerSelfConflict3(t, env):
         res = close_file(sess2, fh2, stateid=stateid2)
         check(res)
 
+def _server_now(sess, env, name):
+    """Sample the server's clock
+
+    The server may ignore a proxied time that is before the file's
+    time_modify and clamp one that is past its own clock (RFC 9754,
+    section 5), so use the server's clock rather than this host's:
+    create a scratch directory, take its time_modify, and remove it.
+    """
+    res = sess.compound(env.home + [op.savefh(),
+                                    op.create(createtype4(NF4DIR), name,
+                                              {FATTR4_MODE: 0o755}),
+                                    op.getattr(1<<FATTR4_TIME_MODIFY),
+                                    op.restorefh(),
+                                    op.remove(name)])
+    check(res)
+    return res.resarray[-3].obj_attributes[FATTR4_TIME_MODIFY]
+
 def _testCbGetattr(t, env, change=0, size=0):
     cb = threading.Event()
     cbattrs = {}
@@ -559,20 +576,7 @@ def testCbGetattrAfterSyncWrite(t, env):
     check(res)
 
     if delegtype == OPEN_DELEGATE_WRITE_ATTRS_DELEG:
-        # The server may ignore a proxied time that is before the
-        # file's time_modify and clamp one that is past its own clock
-        # (RFC 9754, section 5), so sample the server's clock rather
-        # than this host's: create a scratch directory, take its
-        # time_modify, and remove it.
-        name = env.testname(t) + b"_clock"
-        res = sess1.compound(env.home + [op.savefh(),
-                                         op.create(createtype4(NF4DIR), name,
-                                                   {FATTR4_MODE: 0o755}),
-                                         op.getattr(1<<FATTR4_TIME_MODIFY),
-                                         op.restorefh(),
-                                         op.remove(name)])
-        check(res)
-        now = res.resarray[-3].obj_attributes[FATTR4_TIME_MODIFY]
+        now = _server_now(sess1, env, env.testname(t) + b"_clock")
         attrs2 = dict(attrs1)
         attrs2[FATTR4_TIME_ACCESS] = now
         attrs2[FATTR4_TIME_MODIFY] = now
