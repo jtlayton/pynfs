@@ -815,3 +815,15 @@ def testDelegTimesCbGetattr(t, env):
     CODE: DELEG30
     """
     _testDelegTimesStable(t, env, observe=True)
+
+def testDelegTimesCbGetattrEarlyStamp(t, env):
+    """Attributes seen through CB_GETATTR survive the holder's return
+
+    As DELEG30, but the time_modify the holder reports predates the
+    server's WRITE stamp, as when a client stamps on write(2) and flushes
+    later.
+
+    FLAGS: deleg all
+    CODE: DELEG31
+    """
+    _testDelegTimesStable(t, env, early_stamp=True, observe=True)
